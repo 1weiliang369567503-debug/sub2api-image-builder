@@ -3,9 +3,9 @@ name: Build sub2api arm64 image
 # 从 DeanZFC/sub2api-custom 拉取源码，在 GitHub 的 arm64 runner 上原生编译，
 # 产出的镜像推到本仓库所属账号的 GHCR。服务器只需 docker pull，无需本地编译。
 #
-# 用法：Actions → Build sub2api arm64 image → Run workflow
-#   source_ref : 上游分支 / tag / commit sha，默认 sub2api-custom
-#   version    : 镜像标签，留空则自动读取仓库里的 FORK_VERSION 文件
+# 两种触发方式：
+#   1. 手动：Actions → Build sub2api arm64 image → Run workflow
+#   2. 定时：每小时检查一次上游，有新版本就自动构建（已存在则跳过）
 
 on:
   workflow_dispatch:
@@ -18,39 +18,82 @@ on:
         description: '镜像版本标签（留空则自动读 FORK_VERSION）'
         required: false
         default: ''
+  schedule:
+    - cron: '23 * * * *'
 
 permissions:
   contents: read
   packages: write
 
+concurrency:
+  group: build-arm64
+  cancel-in-progress: false
+
 jobs:
+  # ---------------------------------------------------------------------------
+  # 解析上游版本；定时触发时若镜像已存在则跳过，避免重复构建
+  # ---------------------------------------------------------------------------
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.resolve.outputs.should_build }}
+      ref: ${{ steps.resolve.outputs.ref }}
+      version: ${{ steps.resolve.outputs.version }}
+      sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - name: 解析上游 ref 与版本号
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          REF="${{ inputs.source_ref }}"
+          VER="${{ inputs.version }}"
+
+          if [ -z "$REF" ]; then
+            REF="sub2api-custom"
+          fi
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+
+          SHA=$(gh api "repos/DeanZFC/sub2api-custom/commits/$REF" --jq '.sha')
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "上游 ref=$REF  提交=$SHA"
+
+          if [ -z "$VER" ]; then
+            VER=$(gh api "repos/DeanZFC/sub2api-custom/contents/FORK_VERSION?ref=$SHA" \
+                    --jq '.content' | base64 -d | tr -d '\r\n' | sed 's/^v//')
+          fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "版本=$VER"
+
+          # 手动触发时总是构建；定时触发时，镜像已存在就跳过
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "手动触发，直接构建"
+          elif docker manifest inspect \
+                 "ghcr.io/${{ github.repository_owner }}/sub2api:$VER" > /dev/null 2>&1; then
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "镜像 $VER 已存在，跳过构建"
+          else
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "镜像 $VER 不存在，开始构建"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # 实际构建
+  # ---------------------------------------------------------------------------
   build:
+    needs: [resolve]
+    if: needs.resolve.outputs.should_build == 'true'
     runs-on: ubuntu-24.04-arm
     steps:
       - name: 拉取上游源码
         uses: actions/checkout@v4
         with:
           repository: DeanZFC/sub2api-custom
-          ref: ${{ inputs.source_ref }}
+          ref: ${{ needs.resolve.outputs.sha }}
           fetch-depth: 1
-
-      - name: 解析版本号与提交
-        id: meta
-        run: |
-          set -euo pipefail
-          SHA=$(git rev-parse HEAD)
-          VER="${{ inputs.version }}"
-          if [ -z "$VER" ]; then
-            VER=$(tr -d '\r\n' < FORK_VERSION | sed 's/^v//')
-          fi
-          if [ -z "$VER" ]; then
-            echo "无法确定版本号，请手动指定 version" >&2
-            exit 1
-          fi
-          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
-          echo "version=$VER" >> "$GITHUB_OUTPUT"
-          echo "提交: $SHA"
-          echo "版本: $VER"
 
       - name: 配置 Buildx
         uses: docker/setup-buildx-action@v3
@@ -70,15 +113,15 @@ jobs:
           platforms: linux/arm64
           push: true
           tags: |
-            ghcr.io/${{ github.repository_owner }}/sub2api:${{ steps.meta.outputs.version }}
+            ghcr.io/${{ github.repository_owner }}/sub2api:${{ needs.resolve.outputs.version }}
             ghcr.io/${{ github.repository_owner }}/sub2api:latest
           labels: |
-            org.opencontainers.image.revision=${{ steps.meta.outputs.sha }}
-            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+            org.opencontainers.image.revision=${{ needs.resolve.outputs.sha }}
+            org.opencontainers.image.version=${{ needs.resolve.outputs.version }}
             org.opencontainers.image.source=https://github.com/DeanZFC/sub2api-custom
           build-args: |
-            VERSION=${{ steps.meta.outputs.version }}
-            COMMIT=${{ steps.meta.outputs.sha }}
+            VERSION=${{ needs.resolve.outputs.version }}
+            COMMIT=${{ needs.resolve.outputs.sha }}
             BUILD_TYPE=source
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -90,7 +133,7 @@ jobs:
             echo ""
             echo "| 项 | 值 |"
             echo "|---|---|"
-            echo "| 上游提交 | \`${{ steps.meta.outputs.sha }}\` |"
-            echo "| 版本 | \`${{ steps.meta.outputs.version }}\` |"
-            echo "| 镜像 | \`ghcr.io/${{ github.repository_owner }}/sub2api:${{ steps.meta.outputs.version }}\` |"
+            echo "| 上游提交 | \`${{ needs.resolve.outputs.sha }}\` |"
+            echo "| 版本 | \`${{ needs.resolve.outputs.version }}\` |"
+            echo "| 镜像 | \`ghcr.io/${{ github.repository_owner }}/sub2api:${{ needs.resolve.outputs.version }}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
